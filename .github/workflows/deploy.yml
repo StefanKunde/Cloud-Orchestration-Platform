@@ -1,0 +1,79 @@
+name: Build & Deploy (main)
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.actor }}/task-provisioning-api:main
+          cache-from: type=registry,ref=ghcr.io/${{ github.actor }}/task-provisioning-api:main
+          cache-to: type=inline
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy provisioning service
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          command_timeout: 15m
+          script_stop: true
+          envs: GHCR_USER,GHCR_TOKEN,PROVISIONING_API_ENV_FILE
+          script: |
+            set -euo pipefail
+            umask 077
+            install -d -m 700 /opt/provisioning/infra/env
+
+            if [ -z "${PROVISIONING_API_ENV_FILE:-}" ]; then
+              echo "ERROR: Missing PROVISIONING_API_ENV_FILE secret"; exit 1
+            fi
+
+            echo "PROVISIONING_API_ENV_FILE received: $(printf '%s' "$PROVISIONING_API_ENV_FILE" | wc -c) bytes"
+
+            tmp="$(mktemp)"
+            printf '%s\n' "$PROVISIONING_API_ENV_FILE" > "$tmp"
+            sed -i 's/\r$//' "$tmp"
+            install -m 600 "$tmp" /opt/provisioning/infra/env/api.env
+            rm -f "$tmp"
+
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            fi
+
+            cd /opt/provisioning/infra
+            docker network create provisioning-net || true
+
+            PROVISIONING_API_TAG=main docker compose pull provisioning_api
+            PROVISIONING_API_TAG=main docker compose up -d provisioning_api
+
+            docker system prune -f
+        env:
+          GHCR_USER:                  ${{ secrets.GHCR_USER }}
+          GHCR_TOKEN:                 ${{ secrets.GHCR_TOKEN }}
+          PROVISIONING_API_ENV_FILE:  ${{ secrets.PROVISIONING_API_ENV_FILE }}
+
